@@ -150,8 +150,12 @@ def build_screening_agent() -> Agent:
     #
     # Hint: Use temperature=0.0 for deterministic classification
     # ───────────────────────────────────────────────────────
-    pass  # Replace with your implementation
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.0)
+    system_prompt = """You are a content moderation agent using Nova Lite for fast screening of social media posts. 
+Your task is to call the tool 'screen_post' with the given post_id and report the classification (SAFE, HARMFUL, or BORDERLINE) along with the confidence score.
+Do not take any other actions, just respond with the JSON response from the tool call."""
 
+    return Agent(model=model, system_prompt=system_prompt, tools=[screen_post])
 
 # ═══════════════════════════════════════════════════════
 #  AGENT 2: DEEP REVIEW AGENT  (Claude — nuanced analysis)
@@ -203,7 +207,12 @@ def build_review_agent() -> Agent:
     #
     # Hint: Use temperature=0.1 for analytical consistency
     # ───────────────────────────────────────────────────────
-    pass  # Replace with your implementation
+    model = BedrockModel(model_id=CLAUDE_MODEL, region_name=AWS_REGION, temperature=0.1)
+    system_prompt = """You are a content moderation agent using Claude for deep contextual analysis of borderline posts.
+Your task is to call the tool 'deep_review_post' with the given post_id and report the final verdict (SAFE|HARMFUL) along with a one-sentence reason.
+You must only respond with the JSON output from the tool call, and do not take any other actions."""
+
+    return Agent(model=model, system_prompt=system_prompt, tools=[deep_review_post])
 
 
 # ═══════════════════════════════════════════════════════
@@ -251,7 +260,10 @@ def build_notice_agent() -> Agent:
     #
     # Hint: Use temperature=0.3 for slightly creative communication
     # ───────────────────────────────────────────────────────
-    pass  # Replace with your implementation
+    model = BedrockModel(model_id=NOVA_PRO_MODEL, region_name=AWS_REGION, temperature=0.3)
+    system_prompt = """You are a content moderation agent using Nova Pro for drafting moderation notices. You will receive a post_id and violation_type (harmful or warning). Your task is to call the tool 'generate_notice' with these parameters and report the action taken (REMOVED|FLAGGED), the notice text, and the reason for the action. Only respond with the JSON output from the tool call."""
+
+    return Agent(model=model, system_prompt=system_prompt, tools=[generate_notice])
 
 
 # ═══════════════════════════════════════════════════════

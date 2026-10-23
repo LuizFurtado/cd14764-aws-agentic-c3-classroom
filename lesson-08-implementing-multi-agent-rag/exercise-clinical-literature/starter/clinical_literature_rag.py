@@ -318,11 +318,14 @@ def build_drug_interaction_retriever(query: str,
 
     # TODO 1: Create a BedrockModel for the retriever
     # Hint: Same as demo — use NOVA_LITE_MODEL, temperature=0.0
-    model = None  # Replace with BedrockModel(...)
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.0)
 
     # TODO 2: Write a system prompt for this retriever
     # Hint: Tell the agent to call retrieve_drug_interactions and report results
-    system_prompt = ""  # Replace with retriever instructions
+    system_prompt = """You're a specialized clinical retriever agent for the Drug Interactions Knowledge Base. Your only task is:
+    1) Call the retrieve_drug_interactions tool with the user's query.
+    2) Report the retrieved passages and their relevance scores in JSON format.
+    You should not add any other information or commentary. Only return the JSON output from the tool."""
 
     @tool
     def retrieve_drug_interactions(search_query: str) -> str:
@@ -359,7 +362,7 @@ def build_drug_interaction_retriever(query: str,
 
     # TODO 3: Return an Agent with the model, system_prompt, and tools
     # Hint: Agent(model=model, system_prompt=system_prompt, tools=[retrieve_drug_interactions])
-    pass  # Replace with return Agent(...)
+    return Agent(model=model, system_prompt=system_prompt, tools=[retrieve_drug_interactions])
 
 
 def build_guidelines_retriever(query: str,
@@ -368,11 +371,14 @@ def build_guidelines_retriever(query: str,
 
     # TODO 4: Create a BedrockModel for the retriever
     # Hint: Same as TODO 1 — use NOVA_LITE_MODEL, temperature=0.0
-    model = None  # Replace with BedrockModel(...)
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.0)
 
     # TODO 5: Write a system prompt for this retriever
     # Hint: Tell the agent to call retrieve_guidelines and report results
-    system_prompt = ""  # Replace with retriever instructions
+    system_prompt = """You're a specialized clinical retriever agent for the Clinical Guidelines Knowledge Base. Your only task is:
+    1) Call the retrieve_guidelines tool with the user's query.
+    2) Report the retrieved passages and their relevance scores in JSON format.
+    You should not add any other information or commentary. Only return the JSON output from the tool."""
 
     @tool
     def retrieve_guidelines(search_query: str) -> str:
@@ -409,7 +415,7 @@ def build_guidelines_retriever(query: str,
 
     # TODO 6: Return an Agent with the model, system_prompt, and tools
     # Hint: Agent(model=model, system_prompt=system_prompt, tools=[retrieve_guidelines])
-    pass  # Replace with return Agent(...)
+    return Agent(model=model, system_prompt=system_prompt, tools=[retrieve_guidelines])
 
 
 # RESULT AGGREGATION + DEDUPLICATION
@@ -425,7 +431,13 @@ def deduplicate_passages(passages: list[dict], similarity_threshold: float = 0.8
     Production: Use embedding cosine similarity between passage vectors.
     """
     # Replace with deduplication logic
-    return passages  # Currently returns all — implement filtering
+    seen_doc_ids = set()
+    unique_passages = []
+    for p in passages:
+        if p["doc_id"] not in seen_doc_ids:
+            seen_doc_ids.add(p["doc_id"])
+            unique_passages.append(p)
+    return unique_passages  # Currently returns all — implement filtering
 
 
 def aggregate_results(drug_passages: list, guideline_passages: list,
@@ -442,7 +454,10 @@ def aggregate_results(drug_passages: list, guideline_passages: list,
     Hint: Same as demo's aggregate_results, plus the deduplication call
     """
     # Replace with aggregation logic
-    return []
+    combined = drug_passages + guideline_passages
+    unique_passages = deduplicate_passages(combined)
+    unique_passages.sort(key=lambda x: x["score"], reverse=True)
+    return unique_passages[:top_k]
 
 
 # SYNTHESIS AGENT — Structured clinical output

@@ -36,6 +36,8 @@ https://github.com/aws/agentcore-cli) through the pre-written helper
 src/agentcore_cli.py - see the README for the prerequisites (Node.js 20+, uv).
 """
 
+from xml.dom.minidom import Attr
+
 import boto3
 import json
 import time
@@ -225,10 +227,11 @@ def build_inventory_agent() -> Agent:
     """
 
     # TODO: Create a BedrockModel using the WORKER model
-    pass
+    model = BedrockModel(model_id=config.WORKER_MODEL_ID, region_name=config.AWS_REGION, temperature=0.0)
 
     # TODO: System prompt for the Inventory Agent
-    pass
+    system_prompt = """You are an inventory agent. Your tasks are retrieve order and customer information from the database. You do not make any decisions or provide any information. Your only task is to execute the tools provided to you and return the results. You will be given a customer_id and order_id, and you will use the check_order_status tool to retrieve the order information. You will also use the get_customer_tier tool to retrieve the customer's tier information. Finally, you will use the list_customer_orders tool to retrieve all orders for the customer. You will return the results of these tools in a structured format.
+"""
 
     # TODO: Implement check_order_status
     # NOTE: the Orders table has a COMPOSITE key (customer_id = partition key,
@@ -248,7 +251,16 @@ def build_inventory_agent() -> Agent:
             Order record (order_id, status, product_name, order_date, price, ...)
             or a not-found message
         """
-        pass
+        table = dynamodb.Table(config.ORDERS_TABLE)
+        try:
+            response = table.get_item(Key={'customer_id': customer_id, 'order_id': order_id})
+            item = response.get('Item')
+            if not item:
+                return {'error': f"Order {order_id} for customer {customer_id} not found."}
+            return item
+        except ClientError as e:
+            logger.error(f"DynamoDB get_item failed: {e}")
+            return {'error': f"Failed to retrieve order {order_id} for customer {customer_id}."}
 
     # TODO: Implement get_customer_tier
     @tool
@@ -263,7 +275,16 @@ def build_inventory_agent() -> Agent:
         Returns:
             Customer profile including tier and account details
         """
-        pass
+        table = dynamodb.Table(config.CUSTOMERS_TABLE)
+        try:
+            response = table.get_item(Key={'customer_id': customer_id})
+            item = response.get('Item')
+            if not item:
+                return {'error': f"Customer {customer_id} not found."}
+            return item
+        except ClientError as e:
+            logger.error(f"DynamoDB get_item failed: {e}")
+            return {'error': f"Failed to retrieve customer {customer_id}."}
 
     # TODO: Implement list_customer_orders
     @tool
@@ -277,10 +298,21 @@ def build_inventory_agent() -> Agent:
         Returns:
             List of all orders with order_id, status, order_date, and amount
         """
-        pass
+        table = dynamodb.Table(config.ORDERS_TABLE)
+        try:
+            response = table.scan(FilterExpression=Key('customer_id').eq(customer_id))
+            items = response.get('Items', [])
+            return items
+        except ClientError as e:
+            logger.error(f"DynamoDB scan failed: {e}")
+            return {'error': f"Failed to retrieve orders for customer {customer_id}."}
 
     # TODO: Instantiate and return the Agent
-    pass
+    return Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[check_order_status, get_customer_tier, list_customer_orders]
+    )
 
 
 # ───────────────────────────────────────────────────────
@@ -296,10 +328,10 @@ def build_refund_agent() -> Agent:
     """
 
     # TODO: Create a BedrockModel
-    pass
+    model = BedrockModel(model_id=config.WORKER_MODEL_ID, region_name=config.AWS_REGION, temperature=0.0)
 
     # TODO: System prompt for the Refund Agent
-    pass
+    system_prompt = """You are a refund agent. Your task is to determine if a customer's order is eligible for a return or refund based on the order facts and customer tier provided in the WorkflowState. You will use the get_inventory_context tool to retrieve the necessary information. You will then apply the appropriate return policy based on the customer's tier (Standard or Premium) and the order's status and date. You will return a structured response indicating whether the return is approved or denied, along with any relevant instructions or reference numbers.Do not make any decisions or provide any information outside of the refund eligibility determination. Your only task is to execute the tools provided to you and return the results."""
 
     # TODO: Implement get_inventory_context
     @tool
@@ -313,7 +345,10 @@ def build_refund_agent() -> Agent:
         Returns:
             The inventory_agent field from WorkflowState, or empty dict if not yet set
         """
-        pass
+        state = _read_workflow_state(session_id)
+        if not state:
+            return {'error': f"WorkflowState for session {session_id} not found."}
+        return state.get('inventory_agent', {})
 
     # TODO: Implement initiate_refund
     @tool
@@ -329,10 +364,34 @@ def build_refund_agent() -> Agent:
         Returns:
             Confirmation dict with return_reference number and instructions
         """
-        pass
+        table = dynamodb.Table(config.ORDERS_TABLE)
+        try:
+            # Update the order status to 'RETURN_INITIATED' and add a return_reference
+            return_reference = str(uuid.uuid4())
+            response = table.update_item(
+                Key={'customer_id': customer_id, 'order_id': order_id},
+                UpdateExpression="SET #status = :new_status, return_reference = :ref",
+                ExpressionAttributeNames={'#status': 'status'},
+                ExpressionAttributeValues={
+                    ':new_status': 'RETURN_INITIATED',
+                    ':ref': return_reference
+                },
+                ReturnValues="UPDATED_NEW"
+            )
+            return {
+                'return_reference': return_reference,
+                'instructions': f"Please use reference {return_reference} for your return. Reason: {reason}"
+            }
+        except ClientError as e:
+            logger.error(f"DynamoDB update_item failed: {e}")
+            return {'error': f"Failed to initiate return for order {order_id} of customer {customer_id}."}
 
     # TODO: Instantiate and return the Agent
-    pass
+    return Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[get_inventory_context, initiate_refund]
+    )
 
 
 # ───────────────────────────────────────────────────────
@@ -352,28 +411,46 @@ def build_policy_agent() -> Agent:
     @tool
     def retrieve_returns_policy(query: str) -> str:
         """Retrieve relevant passages from the Returns Policy knowledge base."""
-        pass
+        returns_police_kbs = retrieve_from_knowledge_base(config.RETURNS_KB_ID, query, top_k=3)
+        formatted_results = format_kb_results(returns_police_kbs)
+        return formatted_results
 
     # Create the ReturnsPolicyRetrieverAgent with the tool above
-    pass
+    ReturnsPolicyRetrieverAgent = Agent(
+        model=BedrockModel(model_id=config.WORKER_MODEL_ID, region_name=config.AWS_REGION, temperature=0.0),
+        system_prompt="You are a Returns Policy Retriever Agent. Your task is to retrieve relevant passages from the Returns Policy knowledge base based on the customer's query.",
+        tools=[retrieve_returns_policy]
+    )
 
     # TODO: Build ShippingPolicyRetrieverAgent
     @tool
     def retrieve_shipping_policy(query: str) -> str:
         """Retrieve relevant passages from the Shipping Policy knowledge base."""
-        pass
+        shipping_policy_kbs = retrieve_from_knowledge_base(config.SHIPPING_KB_ID, query, top_k=3)
+        formatted_results = format_kb_results(shipping_policy_kbs)
+        return formatted_results
 
     # Create the ShippingPolicyRetrieverAgent with the tool above
-    pass
+    ShippingPolicyRetrieverAgent = Agent(
+        model=BedrockModel(model_id=config.WORKER_MODEL_ID, region_name=config.AWS_REGION, temperature=0.0),
+        system_prompt="You are a Shipping Policy Retriever Agent. Your task is to retrieve relevant passages from the Shipping Policy knowledge base based on the customer's query.",
+        tools=[retrieve_shipping_policy]
+    )
 
     # TODO: Build WarrantyPolicyRetrieverAgent
     @tool
     def retrieve_warranty_policy(query: str) -> str:
         """Retrieve relevant passages from the Warranty Policy knowledge base."""
-        pass
+        warranty_policy_kbs = retrieve_from_knowledge_base(config.WARRANTY_KB_ID, query, top_k=3)
+        formatted_results = format_kb_results(warranty_policy_kbs)
+        return formatted_results
 
     # Create the WarrantyPolicyRetrieverAgent with the tool above
-    pass
+    WarrantyPolicyRetrieverAgent = Agent(
+        model=BedrockModel(model_id=config.WORKER_MODEL_ID, region_name=config.AWS_REGION, temperature=0.0),
+        system_prompt="You are a Warranty Policy Retriever Agent. Your task is to retrieve relevant passages from the Warranty Policy knowledge base based on the customer's query.",
+        tools=[retrieve_warranty_policy]
+    )
 
     # TODO: Implement search_all_policies - parallel RAG retrieval tool
     @tool
@@ -414,28 +491,57 @@ def build_policy_agent() -> Agent:
             Results are returned as values and printed cleanly and
             sequentially by trace.kb_result() after all futures join.
             """
-            pass
+            try:
+                result = str(agent(query))
+                return (domain, result)
+            except Exception as e:
+                logger.error(f"Retriever {domain} failed: {e}")
+                return (domain, f"[Error retrieving {domain} policy: {e}]")
 
         # Use ThreadPoolExecutor to run all three retrievers in parallel
         # Collect results into a dict: {'Returns': '...', 'Shipping': '...', ...}
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                executor.submit(_run_retriever, 'Returns', ReturnsPolicyRetrieverAgent, query): 'Returns',
+                executor.submit(_run_retriever, 'Shipping', ShippingPolicyRetrieverAgent, query): 'Shipping',
+                executor.submit(_run_retriever, 'Warranty', WarrantyPolicyRetrieverAgent, query): 'Warranty',
+            }
+
+            results = []
+            for future in as_completed(futures):
+                domain = futures[future]
+                try:
+                    domain, result_text = future.result()
+                    results.append((domain, result_text))
+                except Exception as exc:
+                    logger.error(f"{domain} retriever generated an exception: {exc}")
+                    results.append((domain, f"[Error retrieving {domain} policy: {exc}]"))
 
         # ── Trace: all KBs responded - print each result sequentially ─────
         # trace.kb_done(len(retrievers))
         # for domain in ['Returns', 'Shipping', 'Warranty']:
         #     trace.kb_result(domain, results.get(domain, '[No results]'))
+        for domain, result_text in results:
+            trace.kb_result(domain, result_text)
 
         # Combine results from all three domains and return
-        pass
+        combined_results = "\n\n".join(f"{domain} Policy:\n{result_text}" for domain, result_text in results)
+        return combined_results
 
     # TODO: Create a BedrockModel for the PolicyAgent coordinator
-    pass
+    model = BedrockModel(model_id=config.WORKER_MODEL_ID, region_name=config.AWS_REGION, temperature=0.3)
 
     # TODO: System prompt for PolicyAgent coordinator
-    pass
+    system_prompt = """You are a Policy Agent coordinator. Your task is to synthesize the results from the Returns, Shipping, and Warranty Policy Retriever Agents into a coherent, grounded answer to the customer's policy question. You will receive the combined results from all three retrievers and must provide a clear, concise response that addresses the customer's query while citing relevant policy passages. Do not make any decisions or provide any information outside of the policy synthesis. Your only task is to execute the tools provided to you and return the results."""
 
     # TODO: Instantiate and return the PolicyAgent coordinator
-    pass
+    PolicyAgent = Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[search_all_policies],
+    )
 
+    return PolicyAgent
 
 # ───────────────────────────────────────────────────────
 #  2.D - COMMUNICATION AGENT
@@ -450,10 +556,10 @@ def build_communication_agent() -> Agent:
     """
 
     # TODO: Create a BedrockModel
-    pass
+    model = BedrockModel(model_id=config.WORKER_MODEL_ID, region_name=config.AWS_REGION, temperature=0.3)
 
     # TODO: System prompt for the Communication Agent
-    pass
+    system_prompt = """You are a Communication Agent. Your task is to draft the final customer-facing message by reading the complete WorkflowState, which includes findings from the InventoryAgent, PolicyAgent, and RefundAgent. You will synthesize this information into a coherent, empathetic response that addresses the customer's original request. Ensure that your response is clear, concise, and professional. Do not make any decisions or provide any information outside of the WorkflowState. Your only task is to execute the tools provided to you and return the results."""
 
     # TODO: Implement get_full_workflow_context
     @tool
@@ -467,10 +573,21 @@ def build_communication_agent() -> Agent:
         Returns:
             Full WorkflowState dict (inventory_agent, policy_agent, refund_agent)
         """
-        pass
+        try:
+            state = _read_workflow_state(session_id)
+            if not state:
+                return {'error': f"WorkflowState for session {session_id} not found."}
+            return state
+        except Exception as e:
+            logger.error(f"Failed to read WorkflowState for session {session_id}: {e}")
+            return {'error': f"Failed to read WorkflowState for session {session_id}."}
 
     # TODO: Instantiate and return the Agent
-    pass
+    return Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[get_full_workflow_context],
+    )
 
 
 # ───────────────────────────────────────────────────────
@@ -488,12 +605,18 @@ def build_orchestrator_agent(
     """
 
     # TODO: Create a BedrockModel using the ORCHESTRATOR model
-    pass
+    model = BedrockModel(model_id=config.ORCHESTRATOR_MODEL_ID, region_name=config.AWS_REGION, temperature=0.0)
 
     # TODO: System prompt for the Orchestrator
     # For arithmetic, skip Inventory, Policy and Refund, but still call
     # CommunicationAgent last. Round currency only after the full calculation.
-    pass
+    system_prompt = """You are the Orchestrator Agent. Your task is to route customer requests to the appropriate worker agents and manage the overall workflow. You will read the current WorkflowState to determine which agent to invoke next and ensure that all relevant information is passed between agents. For any arithmetic calculations, you will skip the Inventory, Policy, and Refund agents, but still call the CommunicationAgent last to draft the final response. Ensure that all currency values are rounded only after the full calculation is complete. Your only task is to execute the tools provided to you and return the results.You must follow the following execution order:
+    1) For every request, always all initialize_session first.
+    2) Order status, return or refund request: first route to inventory_agent, then route to refund_agent.
+    3) For policy related questions, like returning window, shipping rates or warranty coverage, route to policy_agent.
+    4) For account related questions (what is my tier, how many orders have I placed, etc.), route to inventory_agent, never route to policy_agent.
+    5) Mathematical questions (e.g. "what is 5 + 3") should skip inventory_agent, policy_agent and refund_agent, but still route to communication_agent last.
+    6) You should never write the answer yourself, instead delegate to communication_agent to draft the final customer-facing message after all relevant worker agents have run."""
 
     # Each routing tool follows the same pattern:
     #   1. read the current WorkflowState  (_read_workflow_state)
@@ -518,7 +641,15 @@ def build_orchestrator_agent(
         Returns:
             Inventory facts retrieved by the InventoryAgent
         """
-        pass
+        trace.step_start('inventory_agent')
+        workflow_state = _read_workflow_state(session_id)
+        if workflow_state is None:
+            raise KeyError(f"WorkflowState for session {session_id} not found.")
+        expected_version = int(workflow_state['version'])
+        inventory_result = str(inventory_agent(f"Session ID: {session_id}\nCustomer ID: {customer_id}\nRequest: {request}"))
+        _update_workflow_state(session_id, {'inventory_agent': inventory_result}, expected_version)
+        trace.step_done('inventory_agent', expected_version)
+        return inventory_result
 
     # TODO: Implement route_to_policy_agent
     @tool
@@ -534,7 +665,15 @@ def build_orchestrator_agent(
         Returns:
             Policy information retrieved and synthesized by PolicyAgent
         """
-        pass
+        trace.step_start('policy_agent')
+        workflow_state = _read_workflow_state(session_id)
+        if workflow_state is None:
+            raise KeyError(f"WorkflowState for session {session_id} not found.")
+        expected_version = int(workflow_state['version'])
+        policy_result = str(policy_agent(f"Session ID: {session_id}\nRequest: {request}"))
+        _update_workflow_state(session_id, {'policy_agent': policy_result}, expected_version)
+        trace.step_done('policy_agent', expected_version)
+        return policy_result
 
     # TODO: Implement route_to_refund_agent
     @tool
@@ -551,7 +690,15 @@ def build_orchestrator_agent(
         Returns:
             Refund decision from the RefundAgent
         """
-        pass
+        trace.step_start('refund_agent')
+        workflow_state = _read_workflow_state(session_id)
+        if workflow_state is None:
+            raise KeyError(f"WorkflowState for session {session_id} not found.")
+        expected_version = int(workflow_state['version'])
+        refund_result = str(refund_agent(f"Session ID: {session_id}\nCustomer ID: {customer_id}\nRequest: {request}"))
+        _update_workflow_state(session_id, {'refund_agent': refund_result}, expected_version)
+        trace.step_done('refund_agent', expected_version)
+        return refund_result
 
     # TODO: Implement route_to_communication_agent
     @tool
@@ -569,7 +716,15 @@ def build_orchestrator_agent(
         Returns:
             Final customer-facing response drafted by CommunicationAgent
         """
-        pass
+        trace.step_start('communication_agent')
+        workflow_state = _read_workflow_state(session_id)
+        if workflow_state is None:
+            raise KeyError(f"WorkflowState for session {session_id} not found.")
+        expected_version = int(workflow_state['version'])
+        communication_result = str(communication_agent(f"Session ID: {session_id}\nCustomer ID: {customer_id}\nOriginal Request: {original_request}"))
+        _update_workflow_state(session_id, {'communication_agent': communication_result}, expected_version)
+        trace.step_done('communication_agent', expected_version)
+        return communication_result
 
     # TODO: Implement initialize_session
     @tool
@@ -585,10 +740,21 @@ def build_orchestrator_agent(
         Returns:
             Confirmation that the session was initialized
         """
-        pass
+        state = _create_workflow_state(session_id, customer_id)
+        return json.dumps({'message': f"Session {session_id} initialized for customer {customer_id}.", 'workflow_state': state, 'version': state['version']})
 
     # TODO: Instantiate and return the OrchestratorAgent
-    pass
+    return Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[
+            route_to_inventory_agent,
+            route_to_policy_agent,
+            route_to_refund_agent,
+            route_to_communication_agent,
+            initialize_session
+        ]
+    )
 
 
 # ═══════════════════════════════════════════════════════
@@ -714,8 +880,108 @@ def create_guardrail() -> tuple[str, str]:
     # Then promote it from DRAFT to a numbered version with
     # bedrock_client.create_guardrail_version(guardrailIdentifier=...)
     # and return (guardrail_id, guardrail_version).
+    try:
+        create_guardrail = bedrock_client.create_guardrail(
+            name=config.GUARDRAIL_NAME,
+            description="Guardrail for enterprise safety enforcement: blocks harmful content, PII exposure, off-topic subjects, and profanity.",
+            contentPolicyConfig= {
+                'filtersConfig': [
+                    {
+                        'type': 'SEXUAL',
+                        'inputStrength': 'HIGH',
+                        'outputStrength': 'HIGH'
+                    },
+                    {
+                        'type': 'VIOLENCE',
+                        'inputStrength': 'HIGH',
+                        'outputStrength': 'HIGH'
+                    },
+                    {
+                        'type': 'HATE',
+                        'inputStrength': 'HIGH',
+                        'outputStrength': 'HIGH'
+                    },
+                    {
+                        'type': 'INSULTS',
+                        'inputStrength': 'MEDIUM',
+                        'outputStrength': 'MEDIUM'
+                    },
+                    {
+                        'type': 'MISCONDUCT',
+                        'inputStrength': 'MEDIUM',
+                        'outputStrength': 'MEDIUM'
+                    }
+                ]
+            },
+            sensitiveInformationPolicyConfig={
+                'piiEntitiesConfig': [
+                    {
+                        'type': 'CREDIT_DEBIT_CARD_NUMBER',
+                        'action': 'BLOCK'
+                    },
+                    {
+                        'type': 'US_SOCIAL_SECURITY_NUMBER',
+                        'action': 'BLOCK'
+                    },
+                    {
+                        'type': 'EMAIL',
+                        'action': 'ANONYMIZE'
+                    },
+                    {
+                        'type': 'PHONE',
+                        'action': 'ANONYMIZE'
+                    }
+                ]
+            },
+            topicPolicyConfig={
+                'tierConfig': {
+                                'tierName': 'STANDARD'
+                            },
+                'topicsConfig': [
+                    {
+                        'name': config.GUARDRAIL_BLOCKED_TOPICS[0],
+                        'definition': 'Requests related to competitor products or services.',
+                        'type': 'DENY',
+                    },
+                    {
+                        'name': config.GUARDRAIL_BLOCKED_TOPICS[1],
+                        'definition': 'Requests involving  pricing negotiations as haggling / changing an advertised price, excluding arithmetic using an already-specified price and discount.',
+                        'type': 'DENY',
+                    },
+                    {
+                        'name': config.GUARDRAIL_BLOCKED_TOPICS[2],
+                        'definition': 'Requests containing legal threats or demands.',
+                        'type': 'DENY',
+                    }
+                ]
+            },
+            wordPolicyConfig={
+                'managedWordListsConfig': [
+                    {'type': 'PROFANITY'}
+                ]
+            },
+            crossRegionConfig = {
+                'guardrailProfileIdentifier': 'us.guardrail.v1:0'
+            },
+            blockedInputMessaging="This request is blocked due to safety policies. Please rephrase or contact support.",
+            blockedOutputsMessaging="This response is blocked due to safety policies. Please contact support for assistance."
+        )
 
-    pass
+        guardrail_id = create_guardrail["guardrailId"]
+        print(f"Successfully created DRAFT Guardrail. ID: {guardrail_id}")
+
+        version_create = bedrock_client.create_guardrail_version(
+            guardrailIdentifier=guardrail_id,
+            description=f"Initial published version for {config.GUARDRAIL_NAME}"
+        )
+
+        guardrail_version = version_create["version"]
+
+        return guardrail_id, guardrail_version
+    except Exception as e:
+        logger.error(f"Error creating guardrail: ", e)
+        print(f"An error ocurred while creating the guardrail")
+        raise
 
 
 def deploy_to_agentcore_runtime(
@@ -770,7 +1036,26 @@ def deploy_to_agentcore_runtime(
     # 3. Deploy:  agentcore_cli.deploy()        (runs `agentcore deploy -y`)
     # 4. Read the ARN the CLI recorded:
     #      runtime_arn = agentcore_cli.deployed_runtime_arn()
-    runtime_arn = None
+    runtime_env = {
+        'AWS_REGION': config.AWS_REGION,
+        'PROJECT_NAME': config.PROJECT_NAME,
+        'RETURNS_KB_ID': config.RETURNS_KB_ID,
+        'SHIPPING_KB_ID': config.SHIPPING_KB_ID,
+        'WARRANTY_KB_ID': config.WARRANTY_KB_ID,
+        'AGENT_LOG_GROUP': config.AGENT_LOG_GROUP,
+        'GUARDRAIL_ID': guardrail_id,
+        'GUARDRAIL_VERSION': guardrail_version
+    }
+
+    agentcore_cli.configure_runtime(
+        env_vars=runtime_env,
+        network_mode='PUBLIC',
+        protocol='HTTP',
+        execution_role_arn=config.AGENTCORE_ROLE_ARN
+    )
+    agentcore_cli.deploy()
+
+    runtime_arn = agentcore_cli.deployed_runtime_arn()
 
     if not runtime_arn:
         raise NotImplementedError("deploy_to_agentcore_runtime: AgentCore CLI deployment not implemented")
@@ -813,7 +1098,16 @@ def configure_memory(runtime_arn: str) -> str:
     #         'namespaces': ['/summaries/{actorId}/{sessionId}']}}]
     #   - clientToken (e.g. str(uuid.uuid4())) for idempotency
     # Store the API response in `response`.
-    response = None
+
+    response = agentcore_control.create_memory(
+        name=memory_name,
+        description="Agent orchestration memory for final project",
+        eventExpiryDuration=7,
+        memoryStrategies = [{'summaryMemoryStrategy': {
+             'name': 'SessionSummary',
+             'namespaces': ['/summaries/{actorId}/{sessionId}']}}],
+        clientToken = str(uuid.uuid4())
+    )
 
     if response is None:
         raise NotImplementedError("configure_memory: create_memory() not implemented")
@@ -861,8 +1155,17 @@ def configure_observability(runtime_arn: str) -> None:
     # Wrap the call in try/except - on success print the CloudWatch log group
     # and the X-Ray sampling rate; on exception print
     #   "[Note] Observability configuration failed: <e>"
+    logging_configuration = {
+         'cloudWatchConfig': {'logGroupName': config.AGENT_LOG_GROUP,
+                              'logLevel': 'INFO', 'enabled': True},
+         'xRayConfig':       {'enabled': True, 'samplingRate': 1.0},
+    }
 
-    pass
+    try:
+        summary = apply_observability_config(runtime_arn=runtime_arn,logging_configuration=logging_configuration)
+        print(f"[NOTE] Cloudwatch log group created:", str(summary))
+    except Exception as ex:
+        print(f"[NOTE] Observability configuration failed:", ex)
 
 
 # ═══════════════════════════════════════════════════════
